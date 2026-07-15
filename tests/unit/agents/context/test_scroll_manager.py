@@ -206,22 +206,25 @@ def test_capped_result_is_not_re_persisted(store: HistoryStore):
 
 
 async def test_compress_evicts_middle_into_index(store: HistoryStore):
+    # A newer user turn follows the evictable middle: the active turn (last
+    # user msg onward) stays live, the finished older turns are evicted.
     ctx = [
         user("task"),
         assistant("step", headline="did-step"),
+        user("next question"),
         assistant("recent"),
     ]
-    mgr = make_manager(store, pinned=1)
+    mgr = make_manager(store)
     agent = FakeAgent(ctx, tokens=200)
     agent._split_return = (
         ctx[:2],
         ctx[2:],
-    )  # compress [task, step], keep last
+    )  # compress [task, step], keep [next, recent]
     await mgr.compress(agent)
-    # Context is rebuilt as head + placeholder + tail.
+    # Context is rebuilt as placeholder + tail.
     assert len(agent.state.context) == 3
     names = [m.name for m in agent.state.context]
-    assert "memory" in names  # the index placeholder
+    assert names[0] == "memory"  # the index placeholder leads
     assert "did-step" in mgr._index.render()
 
 
@@ -231,11 +234,12 @@ async def test_compress_does_not_index_boundary_msg_still_in_tail(
     """The boundary Msg is deep-copied into BOTH split halves under the same
     id. It must NOT be folded into the eviction index while its reserve copy
     is still live in the tail."""
-    pinned = user("task")
+    old_task = user("task")
     a = assistant("middle turn", headline="MIDDLE")
+    current = user("current request")
     boundary = assistant("boundary turn", headline="BOUNDARY")
-    ctx = [pinned, a, boundary]
-    mgr = make_manager(store, pinned=1)
+    ctx = [old_task, a, current, boundary]
+    mgr = make_manager(store)
     agent = FakeAgent(ctx, tokens=200)
     # Mimic AgentScope: boundary id appears in BOTH halves (same id).
     compress_half = boundary
@@ -249,7 +253,10 @@ async def test_compress_does_not_index_boundary_msg_still_in_tail(
         "id",
         boundary.id,
     )  # same id, fewer blocks
-    agent._split_return = ([pinned, a, compress_half], [reserve_half])
+    agent._split_return = (
+        [old_task, a, current, compress_half],
+        [reserve_half],
+    )
 
     await mgr.compress(agent)
     rendered = mgr._index.render()
@@ -257,6 +264,150 @@ async def test_compress_does_not_index_boundary_msg_still_in_tail(
     assert "BOUNDARY" not in rendered  # still live → must not be indexed
     # And the boundary id is still present in the live context.
     assert boundary.id in {m.id for m in agent.state.context}
+
+
+async def test_compress_keeps_active_turn_live(store: HistoryStore):
+    """The token-based split may push the CURRENT user request (and its
+    running assistant chain) into the compress half. The active turn must
+    stay live — evicting it makes the model answer an older message
+    (#5747)."""
+    old_u = user("older question")
+    old_a = assistant("older reply", headline="OLD")
+    cur_u = user("/heartbeat")
+    cur_a = assistant("running tools", headline="RUNNING")
+    ctx = [old_u, old_a, cur_u, cur_a]
+    mgr = make_manager(store)
+    agent = FakeAgent(ctx, tokens=200)
+    # A long active turn blows the reserve budget: the split reserves nothing
+    # and would evict the current request along with the old turns.
+    agent._split_return = (ctx, [])
+    await mgr.compress(agent)
+    live_ids = [m.id for m in agent.state.context]
+    assert cur_u.id in live_ids and cur_a.id in live_ids
+    rendered = mgr._index.render()
+    assert "OLD" in rendered  # the finished old turn is evicted
+    assert "RUNNING" not in rendered  # the active turn is not
+    # The active turn sits after the placeholder, mirroring a normal tail.
+    names = [m.name for m in agent.state.context]
+    assert names.index("memory") < live_ids.index(cur_u.id)
+
+
+async def test_compress_noop_when_active_turn_fits_reserve(
+    store: HistoryStore,
+):
+    """Single-user-msg session (e.g. a cron run): the whole context is the
+    active turn and nothing is evictable. While the window still fits the
+    reserve, compress leaves it untouched — no compaction, no fold."""
+    ctx = [
+        user("/heartbeat"),
+        assistant("step one", headline="S1"),
+        assistant("step two", headline="S2"),
+    ]
+    mgr = make_manager(store)
+    agent = FakeAgent(ctx, tokens=200)  # over trigger, under reserve (500)
+    agent._split_return = (ctx, [])
+    await mgr.compress(agent)
+    assert [m.id for m in agent.state.context] == [m.id for m in ctx]
+    assert mgr._index.is_empty
+
+
+async def test_pressure_fold_stubs_older_results_keeps_newest(
+    store: HistoryStore,
+):
+    """Nothing evictable and the window overflows the reserve: the active
+    turn's completed tool results are stubbed in place to recall pointers.
+    The request, tool calls, reasoning, and the NEWEST result stay verbatim;
+    the durable rows keep the full outputs; the Msg object (and id) is
+    untouched so the runtime keeps extending the same message."""
+    blocks = []
+    for i in range(3):
+        blocks.append(TextBlock(type="text", text=f"step {i}"))
+        blocks.append(
+            ToolCallBlock(
+                type="tool_call",
+                id=f"c{i}",
+                name="grep",
+                input="{}",
+            ),
+        )
+        blocks.append(
+            ToolResultBlock(
+                type="tool_result",
+                id=f"c{i}",
+                name="grep",
+                output=[TextBlock(type="text", text=f"RESULT-{i}")],
+            ),
+        )
+    turn = Msg(name="a", role="assistant", content=blocks)
+    ctx = [user("/heartbeat"), turn]
+    mgr = make_manager(store)
+    agent = FakeAgent(ctx, tokens=600)  # > reserve (500): sustained pressure
+    agent._split_return = (ctx, [])  # split would evict everything
+    await mgr.compress(agent)
+
+    # Same live objects — no rebuild happened (nothing was evicted).
+    assert agent.state.context == ctx
+    assert agent.state.context[-1] is turn
+
+    def out_text(i: int) -> str:
+        block = turn.content[3 * i + 2]
+        return block.output[0].text
+
+    assert "ms.expand(" in out_text(0)  # folded → seq-addressed stub
+    assert "ms.expand(" in out_text(1)
+    assert out_text(2) == "RESULT-2"  # newest result kept verbatim
+    # The durable rows still hold the FULL outputs (persisted before fold).
+    for i in range(3):
+        row = store._conn.execute(
+            "SELECT content FROM conversation_history "
+            f"WHERE kind='tool_result' AND tool_call_id='c{i}'",
+        ).fetchone()
+        assert row["content"] == f"RESULT-{i}"
+
+    # Idempotent: a second round neither double-folds nor rewrites rows.
+    await mgr.compress(agent)
+    assert out_text(0).count("[scroll folded]") == 1
+    assert out_text(2) == "RESULT-2"
+
+
+async def test_empty_middle_still_compacts_index_under_pressure(
+    store: HistoryStore,
+):
+    """Regression for the phase-1 early return: with nothing evictable but
+    an index already built, sustained pressure must still roll the index up
+    (and re-render the placeholder) instead of doing nothing."""
+    from qwenpaw.agents.context.scroll.eviction_index import Leaf
+
+    mgr = make_manager(store)
+    for i in range(3):  # a multi-block Tier 0 from earlier evictions
+        mgr._index.add_eviction(
+            [Leaf(seq=i * 10 + 1, headline=f"h{i}")],
+            seq_lo=i * 10,
+            seq_hi=i * 10 + 9,
+        )
+    ctx = [user("/heartbeat"), assistant("working", headline="W")]
+    mgr._persist_new(FakeAgent(ctx))
+    agent = FakeAgent(ctx, tokens=600)  # > reserve: sustained pressure
+    agent._split_return = (ctx, [])  # nothing evictable
+    await mgr.compress(agent)
+    # The index was force-compacted to a single block and re-rendered.
+    names = [m.name for m in agent.state.context]
+    assert names[0] == "memory"
+    assert (
+        len([ln for ln in mgr._index.describe().splitlines() if "[seq" in ln])
+        == 1
+    )
+    # The active turn is still live, after the placeholder.
+    assert agent.state.context[-1].id == ctx[-1].id
+
+
+def test_seq_by_tcid_round_trips_through_checkpoint(store: HistoryStore):
+    mgr = make_manager(store)
+    mgr._persist_new(FakeAgent([assistant_with_tool("call-7", "out")]))
+    assert "call-7" in mgr._seq_by_tcid
+    mgr2 = make_manager(store)
+    mgr2.load_state(mgr.to_dict())
+    assert mgr2._seq_by_tcid == mgr._seq_by_tcid
 
 
 # -- degraded durability: no eviction on write failure ----------------------
@@ -269,7 +420,7 @@ async def test_compress_does_not_evict_when_persist_fails(
     import sqlite3
 
     ctx = [user("task"), assistant("step", headline="s"), assistant("more")]
-    mgr = make_manager(store, pinned=1)
+    mgr = make_manager(store)
     agent = FakeAgent(ctx, tokens=200)
 
     def boom(*a, **k):
@@ -328,14 +479,15 @@ def _compactable(store, **kw):
     ctx = [
         user("task"),
         assistant("step", headline="did-step"),
+        user("next question"),
         assistant("recent"),
     ]
-    mgr = make_manager(store, pinned=1, **kw)
+    mgr = make_manager(store, **kw)
     agent = FakeAgent(ctx, tokens=200)
     agent._split_return = (
         ctx[:2],
         ctx[2:],
-    )  # evict [step]; keep task + recent
+    )  # evict [step]; keep task + [next, recent]
     return mgr, agent, ctx
 
 
@@ -346,7 +498,7 @@ async def test_compress_offloads_evicted_middle_when_configured(store):
     assert len(off.calls) == 1
     session_id, ids = off.calls[0]
     assert session_id == "s1"
-    assert ids == [ctx[1].id]  # exactly the evicted middle turn
+    assert ids == [ctx[0].id, ctx[1].id]  # exactly the evicted middle
 
 
 async def test_compress_does_not_offload_without_offloader(store):
