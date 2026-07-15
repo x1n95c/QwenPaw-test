@@ -7,8 +7,9 @@ two delegated hooks.
 
 * :meth:`on_save` — every live turn is persisted to the durable
   ``conversation_history`` as it enters the window (write-through).
-* :meth:`compress` — past the token threshold, keep a pinned head + recent tail
-  and fold the evicted middle into an in-context :class:`EvictionIndex`. No
+* :meth:`compress` — past the token threshold, keep the recent tail (and the
+  active turn) and fold the evicted middle into an in-context
+  :class:`EvictionIndex`. No
   summarization, nothing lost — every node points to a ``seq`` span recallable
   via the sandboxed ``recall_history_python`` REPL.
 """
@@ -20,7 +21,7 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from agentscope.message import Msg, UserMsg
+from agentscope.message import Msg, TextBlock, UserMsg
 
 from . import _as_internals as as_internals
 from .eviction_index import EvictionIndex, Leaf
@@ -28,6 +29,11 @@ from .history import HistoryStore
 from .serialize import msg_to_entries
 
 logger = logging.getLogger(__name__)
+
+# Prefix of an in-place folded tool result (the last-resort pressure valve).
+# Doubles as the idempotence marker: an output starting with it is already a
+# stub and is never folded (or counted as reclaimable) again.
+_FOLD_MARK = "[scroll folded]"
 
 
 class ScrollContextManager:
@@ -45,14 +51,12 @@ class ScrollContextManager:
         history: HistoryStore,
         session_id: str,
         agent_id: str | None = None,
-        pinned: int = 1,
         capped_results: dict[str, int] | None = None,
         offloader: Any = None,
     ) -> None:
         self._history = history
         self._session_id = session_id
         self._agent_id = agent_id
-        self._pinned = pinned
         # Dialog archive: when an offloader is wired (``offload_dialog``, on by
         # default), evicted turns are also written to ``dialog/{date}.jsonl``
         # for external consumers. ``history.db`` remains the source of truth.
@@ -68,6 +72,10 @@ class ScrollContextManager:
         self._persisted_tcids: set[
             str
         ] = set()  # tool_call_ids whose result row is stored
+        self._seq_by_tcid: dict[
+            str,
+            int,
+        ] = {}  # tool_call_id -> its result row's seq (fold stubs point here)
         self._synthetic_ids: set[str] = set()  # placeholder msgs we inserted
         self._seq_by_id: dict[
             str,
@@ -138,13 +146,21 @@ class ScrollContextManager:
     async def compress(self, agent: Any, context_config: Any = None) -> None:
         """Evict the middle into the index; roll the index up under pressure.
 
+        A single pressure pipeline — steps 5 and 6 engage only while the
+        context still overflows the reserve, so "nothing evictable" (a
+        single-request session whose active turn IS the whole context) is
+        just step 4 running empty, not a special case:
+
         1. persist     — every live turn is now durable.
         2. trigger     — under the token threshold? nothing to do.
-        3. split       — pinned head | evictable middle | recent tail.
-        4. add_eviction— fold the middle into the index as a new Tier 0 block,
-                         rebuild context = head + [index] + tail.
+        3. split       — evictable middle | recent tail (+ active turn).
+        4. add_eviction— fold the middle (if any) into the index as a new
+                         Tier 0 block, rebuild context = [index] + tail.
         5. compact     — while the rebuilt context still overflows, shrink the
                          index one step and rebuild. Always progresses.
+        6. fold        — still overflowing: stub the active turn's completed
+                         tool results in place (last resort; the request and
+                         the newest result stay verbatim).
         """
         cfg = context_config or agent.context_config
 
@@ -162,11 +178,10 @@ class ScrollContextManager:
             < cfg.trigger_ratio * agent.model.context_size
         ):
             return
-        if len(agent.state.context) <= self._pinned + 1:
+        if len(agent.state.context) <= 1:
             return
 
-        # 3) Pairing-safe split; keep pinned head + recent tail, evict the
-        #    middle.
+        # 3) Pairing-safe split; keep the recent tail, evict the middle.
         reserve = cfg.reserve_ratio * agent.model.context_size
         to_compress, to_reserve = await as_internals.split_for_compression(
             agent,
@@ -176,7 +191,6 @@ class ScrollContextManager:
         real = lambda msgs: [
             m for m in msgs if m.id not in self._synthetic_ids
         ]
-        head = real(to_compress[: self._pinned])
         tail = real(to_reserve)
         # AgentScope's pairing-safe split deep-copies the *boundary* Msg into
         # BOTH halves under the SAME id (its blocks divided between compress
@@ -186,35 +200,58 @@ class ScrollContextManager:
         # visible, so it isn't evicted yet. It gets indexed in a later round
         # once it moves fully onto the compress side.
         tail_ids = {m.id for m in tail}
+        active_tail = self._active_turn_tail(agent)
+        active_ids = {m.id for m in active_tail}
         middle = [
             m
-            for m in real(to_compress[self._pinned :])
-            if m.id not in tail_ids
+            for m in real(to_compress)
+            if m.id not in tail_ids and m.id not in active_ids
         ]
-        if not middle:
-            return
+        if active_tail:
+            # Replace any partial boundary deep-copy in the tail with the
+            # full live Msg from the context.
+            tail = [m for m in tail if m.id not in active_ids]
+            tail.extend(active_tail)
 
-        # 3b) Optional legacy archive of the evicted turns (opt-in). The full
-        #     turns are already durable in history.db; this is a redundant
-        #     dialog/*.jsonl copy for external consumers. A write failure must
-        #     never abort compaction.
-        await self._offload_dialog(middle)
+        if middle:
+            # 3b) Optional legacy archive of the evicted turns (opt-in). The
+            #     full turns are already durable in history.db; this is a
+            #     redundant dialog/*.jsonl copy for external consumers. A
+            #     write failure must never abort compaction.
+            await self._offload_dialog(middle)
 
-        # 4) Fold the evicted middle into the index as a new Tier 0 block.
-        self._index_evicted(middle)
-        self._rebuild_context(agent, head, tail)
+            # 4) Fold the evicted middle into the index as a new Tier 0
+            #    block.
+            self._index_evicted(middle)
+            self._rebuild_context(agent, tail)
 
         # 5) Pressure-triggered compaction: shrink the index one step at a
         #    time until we fit (or it collapses to a single line). Always
-        #    terminates.
-        while (
-            await agent.model.count_tokens(
-                **(await as_internals.prepare_model_input(agent)),
+        #    terminates. Runs even when nothing was evicted this round — an
+        #    empty middle must not leave an already-built index uncompacted.
+        tokens = await self._live_tokens(agent)
+        while tokens > reserve and self._index.compact():
+            self._rebuild_context(agent, tail)
+            tokens = await self._live_tokens(agent)
+
+        # 6) Last resort — the live window STILL overflows, so the pressure
+        #    is the active turn itself (e.g. a single-request cron run with a
+        #    long tool chain). Stub its completed tool results in place.
+        if tokens > reserve and self._fold_active_turn_results(agent):
+            tokens = await self._live_tokens(agent)
+        if tokens > reserve:
+            logger.warning(
+                "scroll: context still over reserve (%d > %d) after "
+                "compaction and active-turn fold",
+                tokens,
+                reserve,
             )
-            > reserve
-            and self._index.compact()
-        ):
-            self._rebuild_context(agent, head, tail)
+
+    async def _live_tokens(self, agent: Any) -> int:
+        """Token count of the live context as the model would receive it."""
+        return await agent.model.count_tokens(
+            **(await as_internals.prepare_model_input(agent)),
+        )
 
     # -- write-through -------------------------------------------------------
 
@@ -261,6 +298,7 @@ class ScrollContextManager:
                             dedup_key=tcid,
                         )
                     self._persisted_tcids.add(tcid)
+                    self._seq_by_tcid[tcid] = seq
                 else:
                     nblk = len(entry.blocks or ())
                     if mid in self._persisted_ids:
@@ -317,17 +355,110 @@ class ScrollContextManager:
 
     # -- eviction ------------------------------------------------------------
 
+    def _active_turn_tail(self, agent: Any) -> list[Msg]:
+        """Return the current user turn and its in-progress assistant tail.
+
+        AgentScope's token-based split may evict the latest user request when
+        a long tool-running turn exceeds the reserve budget. Under scroll that
+        is unsafe: the model then only sees the eviction index and may answer
+        an older visible message instead of the active task. Keep the latest
+        real user message and everything after it live until the turn finishes.
+        """
+        context = list(getattr(agent.state, "context", []) or [])
+        for idx in range(len(context) - 1, -1, -1):
+            msg = context[idx]
+            mid = getattr(msg, "id", None)
+            if mid in self._synthetic_ids:
+                continue
+            if getattr(msg, "role", None) == "user":
+                return [
+                    m
+                    for m in context[idx:]
+                    if getattr(m, "id", None) not in self._synthetic_ids
+                ]
+        return []
+
+    def _fold_active_turn_results(self, agent: Any) -> int:
+        """Stub the active turn's completed tool results in place; returns
+        how many were folded.
+
+        Last-resort pressure valve: eviction and index compaction have run
+        and the window still overflows the reserve, so the bulk is the
+        active turn itself. The request text, tool calls, and reasoning stay
+        verbatim — only tool_result outputs (all durable since step 1, and
+        typically the token mass) are replaced with a one-line recall
+        pointer. The newest result is kept live: it is the one the next
+        reasoning step most likely consumes.
+
+        Blocks are mutated in place, so the Msg object and its id are
+        untouched — the runtime keeps extending the same message, and the
+        write-through stays consistent (result rows are keyed by
+        tool_call_id and never re-persisted; the model_turn row tracks only
+        non-result blocks). compress() runs only between reasoning steps,
+        when every tool call already has its result, so pairing is never
+        broken.
+        """
+        results = [
+            block
+            for msg in self._active_turn_tail(agent)
+            for block in getattr(msg, "content", None) or []
+            if getattr(block, "type", None) == "tool_result"
+        ]
+        folded = 0
+        for block in results[:-1]:  # keep the newest result verbatim
+            if self._is_folded_stub(block):
+                continue
+            tcid = getattr(block, "id", None)
+            seq = self._seq_by_tcid.get(tcid) if tcid else None
+            if seq is not None:
+                where = f"ms.expand({seq}, {seq})"
+            elif tcid:
+                where = f"ms.recall_tool({tcid!r})"
+            else:
+                where = "ms.search(...)"
+            block.output = [
+                TextBlock(
+                    type="text",
+                    text=(
+                        f"{_FOLD_MARK} full result stored in history — "
+                        f"re-read it in recall_history_python: {where}"
+                    ),
+                ),
+            ]
+            folded += 1
+        if folded:
+            logger.info(
+                "scroll: folded %d completed tool result(s) of the active "
+                "turn to recall stubs",
+                folded,
+            )
+        return folded
+
+    @staticmethod
+    def _is_folded_stub(block: Any) -> bool:
+        """True if this result's output is already a fold stub."""
+        out = getattr(block, "output", None)
+        if isinstance(out, str):
+            return out.startswith(_FOLD_MARK)
+        if isinstance(out, list) and out:
+            first = out[0]
+            text = (
+                first.get("text", "")
+                if isinstance(first, dict)
+                else getattr(first, "text", "") or ""
+            )
+            return str(text).startswith(_FOLD_MARK)
+        return False
+
     def _rebuild_context(
         self,
         agent: Any,
-        head: list[Msg],
         tail: list[Msg],
     ) -> None:
-        """state.context = pinned head + the single index placeholder +
-        tail."""
+        """state.context = the single index placeholder + tail."""
         placeholder = UserMsg(name="memory", content=self._index.render())
         self._synthetic_ids.add(placeholder.id)
-        agent.state.context = head + [placeholder] + tail
+        agent.state.context = [placeholder] + tail
 
     def _index_evicted(self, middle: list[Msg]) -> None:
         """Append the evicted middle to the index as one fresh Tier 0 block.
@@ -375,6 +506,7 @@ class ScrollContextManager:
         return {
             "persisted_ids": sorted(self._persisted_ids),
             "persisted_tcids": sorted(self._persisted_tcids),
+            "seq_by_tcid": dict(self._seq_by_tcid),
             "synthetic_ids": sorted(self._synthetic_ids),
             "seq_by_id": {
                 k: [lo, hi] for k, (lo, hi) in self._seq_by_id.items()
@@ -395,6 +527,7 @@ class ScrollContextManager:
             return
         self._persisted_ids = set(data.get("persisted_ids", ()))
         self._persisted_tcids = set(data.get("persisted_tcids", ()))
+        self._seq_by_tcid = dict(data.get("seq_by_tcid", {}))
         self._synthetic_ids = set(data.get("synthetic_ids", ()))
         self._seq_by_id = {
             k: (lo, hi) for k, (lo, hi) in data.get("seq_by_id", {}).items()
