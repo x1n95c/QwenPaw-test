@@ -3,7 +3,7 @@
 """Unit tests for :class:`ScrollContextManager`.
 
 Covers write-through dedup, the resume checkpoint (no re-append of a restored
-window), the boundary-Msg double-presence fix, cap-middleware seq adoption,
+window), the boundary-Msg double-presence fix, tool-result preview persistence,
 degraded-durability fail-safe (no eviction when a write fails), and retention.
 """
 
@@ -22,6 +22,7 @@ from qwenpaw.agents.context.scroll.history import HistoryStore
 from qwenpaw.agents.context.scroll.manager import ScrollContextManager
 from qwenpaw.agents.context.types import LogEntry
 from qwenpaw.agents.memory.base_memory_manager import BaseMemoryManager
+from qwenpaw.agents.tools.utils import truncate_text_output
 from qwenpaw.constant import AUTO_MEMORY_SEARCH_BLOCK_IDS_KEY
 
 # -- fixtures ---------------------------------------------------------------
@@ -273,22 +274,31 @@ def test_load_state_tolerates_garbage(store: HistoryStore):
     assert mgr._persisted_ids == set()
 
 
-# -- cap-middleware seq adoption --------------------------------------------
+# -- tool-result preview persistence ----------------------------------------
 
 
-def test_capped_result_is_not_re_persisted(store: HistoryStore):
-    """When the cap middleware already wrote a result in full, the manager
-    adopts its seq and does NOT re-persist the truncated in-context stub."""
-    capped = {"call-1": 999}
-    mgr = make_manager(store, capped_results=capped)
-    agent = FakeAgent([assistant_with_tool("call-1", "truncated stub")])
+def test_tool_result_preview_is_persisted_once(store: HistoryStore):
+    """Tool results are persisted exactly as they appear in live context."""
+    mgr = make_manager(store)
+    preview = (
+        "partial output\n"
+        "<<<EXECUTION_TOOL_RESULT_TRUNCATED>>>\n"
+        "Full output saved to: /tmp/tool-result.txt."
+    )
+    agent = FakeAgent([assistant_with_tool("call-1", preview)])
     mgr._persist_new(agent)
-    # No tool_result row was written by the manager (the cap owns it).
+
     rows = store._conn.execute(
-        "SELECT 1 FROM conversation_history "
+        "SELECT content FROM conversation_history "
         "WHERE kind='tool_result' AND tool_call_id='call-1'",
     ).fetchall()
-    assert rows == []
+    assert [row["content"] for row in rows] == [preview]
+    mgr._persist_new(agent)
+    rows = store._conn.execute(
+        "SELECT content FROM conversation_history "
+        "WHERE kind='tool_result' AND tool_call_id='call-1'",
+    ).fetchall()
+    assert [row["content"] for row in rows] == [preview]
     assert "call-1" in mgr._persisted_tcids
 
 
@@ -357,6 +367,47 @@ async def test_compress_does_not_index_boundary_msg_still_in_tail(
     assert boundary.id in {m.id for m in agent.state.context}
 
 
+async def test_compress_restores_complete_non_active_tool_boundary(
+    store: HistoryStore,
+):
+    """A retained non-active boundary Msg must not remain a block fragment.
+
+    AgentScope's splitter can reserve only the tool_result half of a Msg.  The
+    orphan sanitizer used to drop that fragment, silently losing the retained
+    boundary.  Restore the full live Msg before sanitizing instead.
+    """
+    old_u = user("older question")
+    old_a = assistant("older reply", headline="OLD")
+    boundary = assistant_with_tool("call-boundary")
+    cur_u = user("current request")
+    cur_a = assistant("current reply")
+    ctx = [old_u, old_a, boundary, cur_u, cur_a]
+    mgr = make_manager(store)
+    agent = FakeAgent(ctx, tokens=200)
+    reserve_fragment = Msg(
+        name="a",
+        role="assistant",
+        content=[boundary.content[-1]],
+    )
+    object.__setattr__(reserve_fragment, "id", boundary.id)
+    agent._split_return = (
+        [old_u, old_a, boundary],
+        [reserve_fragment, cur_u, cur_a],
+    )
+
+    await mgr.compress(agent)
+
+    retained = next(
+        msg for msg in agent.state.context if msg.id == boundary.id
+    )
+    assert retained is boundary
+    assert [block.type for block in retained.content] == [
+        "text",
+        "tool_call",
+        "tool_result",
+    ]
+
+
 async def test_compress_keeps_active_turn_live(store: HistoryStore):
     """The token-based split may push the CURRENT user request (and its
     running assistant chain) into the compress half. The active turn must
@@ -381,6 +432,36 @@ async def test_compress_keeps_active_turn_live(store: HistoryStore):
     # The active turn sits after the placeholder, mirroring a normal tail.
     names = [m.name for m in agent.state.context]
     assert names.index("memory") < live_ids.index(cur_u.id)
+
+
+async def test_compress_does_not_evict_user_only_exchange_boundary(
+    store: HistoryStore,
+):
+    """If the split lands between an old user request and its assistant
+    reply, pull the reply into the evicted middle. Otherwise scroll archives a
+    user-only span, misses the existing assistant headline, and has to call
+    the model just to label the index."""
+    old_u = user("generate a long fixture")
+    old_a = assistant("fixture generated", headline="FIXTURE GENERATED")
+    cur_u = user("summarize it")
+    cur_a = assistant("summary", headline="SUMMARY")
+    ctx = [old_u, old_a, cur_u, cur_a]
+    mgr = make_manager(store, summarize_unheadlined=True)
+    agent = FakeAgent(ctx, tokens=200)
+    agent._split_return = ([old_u], [old_a, cur_u, cur_a])
+
+    async def fail_summarize(*args, **kwargs):
+        raise AssertionError("user-only fallback summarization should not run")
+
+    mgr._summarize_span = fail_summarize
+
+    await mgr.compress(agent)
+
+    rendered = mgr._index.render()
+    assert "FIXTURE GENERATED" in rendered
+    assert old_a.id not in {m.id for m in agent.state.context}
+    assert cur_u.id in {m.id for m in agent.state.context}
+    assert cur_a.id in {m.id for m in agent.state.context}
 
 
 def continuation_stub(text: str = "Continue working on the task.") -> Msg:
@@ -500,6 +581,38 @@ async def test_fold_not_triggered_between_reserve_and_trigger(
     for block in turn.content:
         if getattr(block, "type", None) == "tool_result":
             assert block.output[0].text.startswith("RESULT-")
+
+
+async def test_compress_retruncates_retained_tool_result_preview(
+    store: HistoryStore,
+    tmp_path: Path,
+):
+    text = "\n".join(f"line {idx}: {'x' * 40}" for idx in range(100))
+    preview, metadata = truncate_text_output(
+        text,
+        start_line=1,
+        total_lines=100,
+        max_bytes=500,
+        file_path="/tmp/full-tool-result.txt",
+    )
+    turn = assistant_with_tool("call-1", preview)
+    turn.content[2].metadata.update(metadata)
+    ctx = [user("current request"), turn]
+    mgr = make_manager(
+        store,
+        compact_tool_result_max_bytes=120,
+        tool_results_dir=str(tmp_path),
+    )
+    agent = FakeAgent(ctx, tokens=[600, 50])
+    agent._split_return = (ctx, [])
+
+    await mgr.compress(agent)
+
+    compacted = turn.content[2].output[0].text
+    assert "covers the next 120 bytes" in compacted
+    assert "/tmp/full-tool-result.txt" in compacted
+    assert "[scroll folded]" not in compacted
+    assert mgr.last_compress["folded"] == 0
 
 
 async def test_pressure_fold_stubs_older_results_keeps_newest(
