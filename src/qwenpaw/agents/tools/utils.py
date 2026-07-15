@@ -5,6 +5,8 @@
 
 import logging
 import re
+import uuid
+from pathlib import Path
 from typing import Any
 
 import aiofiles
@@ -79,6 +81,35 @@ def build_truncation_metadata(
     )
     info["notice"] = _fit_truncation_notice(notice, info)
     return {TRUNCATION_METADATA_KEY: {str(block_index): info}}
+
+
+def safe_filename_part(value: str | None) -> str:
+    """Return a short filesystem-safe filename component."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value or "")[:64].strip("._-")
+    return safe or "tool-result"
+
+
+def save_text_output(
+    text: str,
+    output_dir: Path | str | None,
+    *,
+    name_hint: str | None = None,
+    encoding: str = "utf-8",
+) -> str | None:
+    """Save full text output under ``output_dir`` and return its path.
+
+    Raises ``OSError`` if the directory cannot be created or the file cannot
+    be written, so callers can log context-specific failure details.
+    """
+    if output_dir is None:
+        return None
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    safe_id = safe_filename_part(name_hint)
+    path = output_path / f"{safe_id}-{uuid.uuid4().hex}.txt"
+    path.write_text(text, encoding=encoding)
+    return str(path)
 
 
 # pylint: disable=too-many-return-statements
