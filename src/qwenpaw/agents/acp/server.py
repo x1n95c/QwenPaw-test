@@ -61,6 +61,7 @@ from acp.schema import (
     SseMcpServer,
     TextContentBlock,
     ToolCallUpdate,
+    UsageUpdate,
 )
 from qwenpaw.schemas import (
     AgentRequest,
@@ -935,6 +936,35 @@ class QwenPawACPAgent(Agent):
                     field_meta=usage_meta,
                 ),
             )
+            # Also surface the *current* context occupancy (prompt size vs.
+            # window) over the native ACP ``usage_update`` channel so the TUI
+            # can render a live context-usage bar. ``used`` is the tokens in
+            # context right now (the last call's input); ``size`` is the model
+            # context window. This is distinct from the cumulative ``tok``
+            # tallies carried in the chunk meta above. We emit even with 0s so
+            # the bar clears deterministically when the window or occupancy
+            # becomes unknown (e.g. after a model switch) — the TUI treats 0 as
+            # "hide the bar".
+            usage = usage_meta.get("usage", {})
+            used = int(usage.get("inputTokens", 0) or 0)
+            size = int(usage.get("contextSize", 0) or 0)
+            # Carry the compaction threshold (if known) via ``_meta`` so the
+            # TUI can mark it; usage_update has no field for it. Only attach it
+            # when there's a meaningful bar to mark.
+            ratio = usage.get("compactRatio")
+            field_meta = None
+            valid_ratio = isinstance(ratio, (int, float)) and 0 < ratio < 1
+            if used > 0 and size > 0 and valid_ratio:
+                field_meta = {"compactRatio": float(ratio)}
+            await self._conn.session_update(
+                session_id=session_id,
+                update=UsageUpdate(
+                    sessionUpdate="usage_update",
+                    used=used,
+                    size=size,
+                    field_meta=field_meta,
+                ),
+            )
 
     @staticmethod
     def _pop_session_usage(
@@ -964,6 +994,12 @@ class QwenPawACPAgent(Agent):
                 "outputTokens": raw.get("completion_tokens", 0),
                 "totalTokens": raw.get("total_tokens", 0),
                 "model": raw.get("model_name") or "",
+                # Context window, so the UI can show how full the *current*
+                # context is (inputTokens / contextSize). 0 = unknown.
+                "contextSize": raw.get("context_size", 0),
+                # Auto-compaction threshold (0-1) so the UI can mark it.
+                # None when compaction is disabled/unknown.
+                "compactRatio": raw.get("compact_threshold"),
             },
         }
 
