@@ -1410,6 +1410,8 @@ class FeishuChannel(BaseChannel):
             file_type = "doc" if ext == "docx" else ext
             file_type = "xls" if ext == "xlsx" else file_type
             file_type = "ppt" if ext == "pptx" else file_type
+        elif ext in ("ogg", "opus"):
+            file_type = "opus"
         file_obj = None
         try:
             file_obj = await asyncio.to_thread(path.open, "rb")
@@ -1731,10 +1733,12 @@ class FeishuChannel(BaseChannel):
             file_key[:24] if file_key else "",
         )
         content = json.dumps({"file_key": file_key}, ensure_ascii=False)
+        ext = Path(path_or_url).suffix.lower().lstrip(".")
+        msg_type = "audio" if ext in ("ogg", "opus") else "file"
         return await self._send_message(
             receive_id_type,
             receive_id,
-            "file",
+            msg_type,
             content,
         )
 
